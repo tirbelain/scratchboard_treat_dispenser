@@ -45,8 +45,8 @@ const uint32_t	DISPENSE_COOLDOWN				= 5000u;			// When dispensing was triggered,
 const uint8_t	DISPENSE_AMOUNT					= 1u;				// The number of treats that will be dispensed when triggerd.
 const uint32_t	DISPENSE_PERIOD_LENGTH			= 60u * MINUTES;	// The period is a means of limiting the number of treats that are dispensed over
 const uint8_t	DISPENSE_AMOUNT_PER_PERIOD		= 3u;				// time. During a period only the set amount per period will be dispensed.
-const uint32_t	DISPENSE_INTERACTION_TIME		= 3u * SECONDS;		// This is a means of controlling the sensitivity for triggering. Interactions with the MPU need to be recorded for at least this amount of time before the treat is dispensed. Higher values require longer interactions.
-const uint32_t	DISPENSE_INTERACTION_TIMEOUT	= 6u * SECONDS;		// An interaction can consist of multiple small interactions, not only a continuous long one. This is the time before a interaction will time out. If another interaction is recorded within this period, this is considered the same interaction.
+const uint32_t	DISPENSE_INTERACTION_DURATION	= 3u * SECONDS;		// This is a means of controlling the sensitivity for triggering. Interactions with the MPU need to be recorded for at least this amount of time before the treat is dispensed. Higher values require longer interactions.
+const uint32_t	DISPENSE_INTERACTION_TIMEOUT	= 2u * SECONDS;		// An interaction usually consist of multiple small interactions, not a continuous long one. This constant defines the time before a interaction will time out. If another interaction is recorded within this period, this is considered the same interaction.
 
 
 enum HopperSlot : uint8_t
@@ -59,7 +59,8 @@ uint32_t dispenseCooldownEndTime = 0;
 
 uint32_t recentDispenseTimes[DISPENSE_AMOUNT_PER_PERIOD];
 uint16_t recentDispenseCount = 0;
-uint32_t lastInteractionStartTime = -1;
+uint32_t interactionStartTime = 0;
+uint32_t interactionEndTime = 0;
 
 
 ////////////////////////////////////////////////////////////
@@ -242,9 +243,9 @@ void monitorAccelerometerForInteraction()
 	accelSamplesY.add(sensorState.aaReal.y);
 	accelSamplesZ.add(sensorState.aaReal.z);
 
-	//plotSample(accelSamplesX, "accX", false, false, false, false);
-	//plotSample(accelSamplesY, "accY", false, false, false, false);
-	//plotSample(accelSamplesZ, "accZ", false, false, false, false);
+	//DEBUG_plotSample(accelSamplesX, "accX", false, false, false, false);
+	//DEBUG_plotSample(accelSamplesY, "accY", false, false, false, false);
+	//DEBUG_plotSample(accelSamplesZ, "accZ", false, false, false, false);
 
 	int16_t avgX = accelSamplesX.getAvg();
 	//log("\txMin:");
@@ -271,9 +272,21 @@ void monitorAccelerometerForInteraction()
 		abs(accelSamplesY.getLast() - avgY) > deadzoneY ||
 		abs(accelSamplesZ.getLast() - avgZ) > deadzoneZ)
 	{
-		for (int i = 0; i < DISPENSE_AMOUNT; ++i)
+		// is there an active interaction? if not, start a new one (if not in cooldown)
+		if (!hasDispenseCooldown(now) && !isInteracting(now))
 		{
-			dispense(now);
+			// (re-)start interaction. there isn't an active interaction yet or the latest one has timed-out
+			interactionStartTime = now;
+			logln("Detected new interaction.");
+		}
+		interactionEndTime = now + DISPENSE_INTERACTION_TIMEOUT;
+
+		if (isDispensingAllowed(now))
+		{
+			for (int i = 0; i < DISPENSE_AMOUNT; ++i)
+			{
+				dispense(now);
+			}
 		}
 	}
 
@@ -286,39 +299,52 @@ void monitorAccelerometerForInteraction()
 }
 
 
+bool isInteracting(uint32_t now)
+{
+	return interactionStartTime != 0 && interactionStartTime <= now && now <= interactionEndTime; 
+}
+
+
+////////////////////////////////////////////////////////////
+// performs a few checks whether dispensing is allowed at the moment
+// 1. is there an active cooldown from the previous dispensing?
+// 2. has the current interaction been long enough to trigger? (when this is called, there is always an active interaction)
+bool isDispensingAllowed(uint32_t now)
+{
+	// the cooldown needs to be checked ouside the dispense function as the first dispense does
+	// activate the cooldown which would prevent the following dispensations from happening
+	if (hasDispenseCooldown(now))
+	{
+		logln("Not dispensing! Dispense cooldown active.");
+		return false;
+	}
+
+	if (now < interactionStartTime + DISPENSE_INTERACTION_DURATION)
+	{
+		// interaction was not long enough. do not dispense
+		logln("Not dispensing. Interaction was not long enough.");
+		return false;
+	}
+
+	return true;
+}
+
+
 ////////////////////////////////////////////////////////////
 // performs the dispensing. after a few checks that determin whether dispensing is allowed, select
 // the hopper slot to take the treat from and trigger the servo
 void dispense(uint32_t now)
 {
-	if (hasDispenseCooldown(now))
+	if (!hasPeriodDispensationsLeft(now))
 	{
-		logln("Not dispensing! Dispense cooldown active.");
-		return;
-	}
-	if (!hasPeriodDispensesLeft(now))
-	{
-		logln("Not dispensing. No dispenses left for current period.");
-		return;
-	}
-
-	if (lastInteractionStartTime == 0 || lastInteractionStartTime + DISPENSE_INTERACTION_TIMEOUT < now)
-	{
-		// restart interaction. there wasn't one before or the current one timed-out
-		lastInteractionStartTime = now;
-		logln("Not dispensing. Just started the interaction.");
-		return;
-	}
-
-	if (lastInteractionStartTime + DISPENSE_INTERACTION_TIME > now)
-	{
-		// interaction was not long enough. do not dispense
-		logln("Not dispensing. Interaction was not long enough.");
+		log("Not dispensing. No dispensations left for current period. Next available in ");
+		log((DISPENSE_PERIOD_LENGTH - (now - recentDispenseTimes[0])) / SECONDS);
+		logln(" seconds");
 		return;
 	}
 
 	logln("Dispensing");
-	lastInteractionStartTime = 0;
+	interactionStartTime = 0; // clear the current interaction
 	dispenseCooldownEndTime = now + DISPENSE_COOLDOWN;
 	addDispenseTime(now);
 	int servoTarget = SERVO_POSITION_CENTER;
@@ -352,10 +378,10 @@ bool hasDispenseCooldown(uint32_t now)
 
 
 ////////////////////////////////////////////////////////////
-// record the time for a dispense for the dispenses-per-period check
+// record the time for a dispense for the dispensations-per-period check
 bool addDispenseTime(uint32_t now)
 {
-	if (!hasPeriodDispensesLeft(now)) return false;
+	if (!hasPeriodDispensationsLeft(now)) return false;
 	recentDispenseTimes[recentDispenseCount] = now;
 	++recentDispenseCount;
 	DEBUG_printRecentDispenseTimes();
@@ -364,7 +390,7 @@ bool addDispenseTime(uint32_t now)
 
 
 ////////////////////////////////////////////////////////////
-// checks for recent dispenses that are older than the dispense-period
+// checks for recent dispensations that are older than the dispense-period
 bool canRemoveOldestDispenseTime(uint32_t now)
 {
 	return recentDispenseCount > 0
@@ -373,7 +399,7 @@ bool canRemoveOldestDispenseTime(uint32_t now)
 
 
 ////////////////////////////////////////////////////////////
-// remove old dispense times from the record to allow for more dispensing
+// remove old dispense times from the record to allow for more dispensations
 void removeOldestDispenseTime()
 {
 	--recentDispenseCount;
@@ -386,8 +412,8 @@ void removeOldestDispenseTime()
 
 
 ////////////////////////////////////////////////////////////
-// checks the number of valid recent dispenses in order to determin whether dispensing is allowed at the moment
-bool hasPeriodDispensesLeft(uint32_t now)
+// checks the number of valid recent dispensations in order to determin whether dispensing is allowed at the moment
+bool hasPeriodDispensationsLeft(uint32_t now)
 {
 	return recentDispenseCount < DISPENSE_AMOUNT_PER_PERIOD;
 }
@@ -418,7 +444,7 @@ bool doStateCountDown(uint16_t totalDuration)
 // debug output that logs the recent dispense times
 void DEBUG_printRecentDispenseTimes()
 {
-	log("recent dispenses: ");
+	log("recent dispensations: ");
 	for (int i = 0; i < recentDispenseCount; ++i)
 	{
 		log(recentDispenseTimes[i]);
