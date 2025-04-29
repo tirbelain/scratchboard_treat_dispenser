@@ -1,6 +1,7 @@
 #ifndef __RINGBUFFER_H__
 #define __RINGBUFFER_H__
 
+template<typename T>
 class RingBuffer
 {
 public:
@@ -8,11 +9,11 @@ public:
 		totalSampleCount(count),
 		usedSampleCount(0),
 		currentSample(-1),
-		samples(new int[count])
+		samples(new T[count])
 	{
 		for (int i = 0; i < totalSampleCount; ++i)
 		{
-			samples[i] = 0;
+			samples[i] = T();
 		}
 	}
 
@@ -21,14 +22,14 @@ public:
 		totalSampleCount = newCount;
 		usedSampleCount = 0;
 		currentSample = -1;
-		samples = new int[newCount];
+		samples = new T[newCount];
 		for (int i = 0; i < totalSampleCount; ++i)
 		{
-			samples[i] = 0;
+			samples[i] = T();
 		}
 	}
 
-	void add(int16_t v)
+	void add(T v)
 	{
 		currentSample = currentSample + 1;
 		currentSample = currentSample % totalSampleCount;
@@ -37,9 +38,9 @@ public:
 		samples[currentSample] = v;
 	}
 
-	int16_t getMin()
+	T getMin()
 	{
-		int16_t val = samples[0]; 
+		T val = samples[0]; 
 		for (int i = 1; i < usedSampleCount; ++i)
 		{
 			val = min(samples[i], val);
@@ -47,9 +48,9 @@ public:
 		return val;
 	}
 
-	int16_t getMax()
+	T getMax()
 	{
-		int16_t val = samples[0];
+		T val = samples[0];
 		for (int i = 1; i < usedSampleCount; ++i)
 		{
 			val = max(samples[i], val);
@@ -57,9 +58,9 @@ public:
 		return val;
 	}
 
-	int16_t getSum()
+	T getSum()
 	{
-		int val = 0;
+		T val = 0;
 		for (int i = 0; i < usedSampleCount; ++i)
 		{
 			val += samples[i];
@@ -67,12 +68,12 @@ public:
 		return val;
 	}
 
-	int16_t getAvg()
+	T getAvg()
 	{
 		return usedSampleCount == 0 ? 0 : getSum() / usedSampleCount;
 	}
 
-	int16_t getLast()
+	T getLast()
 	{
 		return currentSample < 0 ? 0 : samples[currentSample];
 	}
@@ -116,11 +117,11 @@ public:
 	{
 		Serial.print("avg: ");
 		Serial.print(getAvg());
-		Serial.print("sum: ");
+		Serial.print(" sum: ");
 		Serial.print(getSum());
-		Serial.print("min: ");
+		Serial.print(" min: ");
 		Serial.print(getMin());
-		Serial.print("max: ");
+		Serial.print(" max: ");
 		Serial.print(getMax());
 		Serial.println("");
 	}
@@ -129,7 +130,7 @@ private:
 	uint8_t totalSampleCount;
 	uint8_t usedSampleCount;
 	uint8_t currentSample;
-	int16_t *samples;
+	T *samples;
 };
 
 #endif // __RINGBUFFER_H__

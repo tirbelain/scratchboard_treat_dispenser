@@ -1,18 +1,17 @@
-#include "MPU6050_6Axis_MotionApps20.h"
+//#define LOG_SENSOR_READINGS_X
+//#define LOG_SENSOR_READINGS_Y
+//#define LOG_SENSOR_READINGS_Z
+
+
+#include "Adafruit_MPU6050.h"
 #include "Servo.h"
+#include "Wire.h"
 
 #include "RingBuffer.h"
 //#define DEBUG_OUTPUT
 #include "Logging.h"
 
-/* Supply your gyro offsets here, scaled for min sensitivity */
-//#define MPU_X_ACCEL_OFFSET -5212
-//#define MPU_Y_ACCEL_OFFSET 1323
-//#define MPU_Z_ACCEL_OFFSET 1656
-//#define MPU_X_GYRO_OFFSET 101
-//#define MPU_Y_GYRO_OFFSET -52
-//#define MPU_Z_GYRO_OFFSET 0
-#include "DMPStatus.h"
+#include "MPU6050Setup.h"
 
 
 
@@ -26,12 +25,10 @@ enum RuntimeStates
 const int16_t	CALIBRATION_PREWARM_DURATION	= 5000;		// 5 seconds - delay before noise detection calibration starts
 
 const int8_t	PIN_SERVO						= 9;
-const int8_t	PIN_MPU_INTERRUPT				= 2;		// Define the interruption #0 pin
 
 const uint32_t	SECONDS							= 1000u;
 const uint32_t	MINUTES							= 60u * SECONDS;
 const uint32_t	HOURS							= 60u * MINUTES;
-
 
 const int SERVO_POSITION_STACK_0				= 0;
 const int SERVO_POSITION_STACK_1				= 180;
@@ -41,13 +38,14 @@ const int SERVO_POSITION_CENTER					= 90;
 // dispensing
 
 // all these times are in milliseconds
-const uint32_t	DISPENSE_COOLDOWN				= 5000u;			// When dispensing was triggered, the next trigger will not happen until this cooldown is complete.
-const uint8_t	DISPENSE_AMOUNT					= 1u;				// The number of treats that will be dispensed when triggerd.
+const uint32_t	DISPENSE_COOLDOWN				= 5000u;			// When dispensing was triggered, the next trigger will not happen until this cooldown is over.
 const uint32_t	DISPENSE_PERIOD_LENGTH			= 60u * MINUTES;	// The period is a means of limiting the number of treats that are dispensed over
-const uint8_t	DISPENSE_AMOUNT_PER_PERIOD		= 3u;				// time. During a period only the set amount per period will be dispensed.
 const uint32_t	DISPENSE_INTERACTION_DURATION	= 3u * SECONDS;		// This is a means of controlling the sensitivity for triggering. Interactions with the MPU need to be recorded for at least this amount of time before the treat is dispensed. Higher values require longer interactions.
 const uint32_t	DISPENSE_INTERACTION_TIMEOUT	= 2u * SECONDS;		// An interaction usually consist of multiple small interactions, not a continuous long one. This constant defines the time before a interaction will time out. If another interaction is recorded within this period, this is considered the same interaction.
 
+const uint8_t	DISPENSE_AMOUNT					= 1u;				// The number of treats that will be dispensed when triggerd.
+const uint8_t	DISPENSE_AMOUNT_PER_PERIOD		= 3u;				// During one period only the set amount of treats will be dispensed.
+const float		DISPENSE_TRIGGER_SENSITIVITY	= 1.5f;				// Factor to scale the deadzone for sensor input. Smaller values increase sensitivity, ie. ie the trigger threshold is exceeded more easily. Larger values decrease sensitivity
 
 enum HopperSlot : uint8_t
 {
@@ -64,38 +62,35 @@ uint32_t interactionEndTime = 0;
 
 
 ////////////////////////////////////////////////////////////
-// periphery interfaces
-MPU6050 mpu;
+// periphery interfaces and state
+Adafruit_MPU6050 mpu;
 Servo servo;
 
-////////////////////////////////////////////////////////////
-// periphery state
-DMPStatus dmpStatus;
-MotionSensorState sensorState;
+SensorState sensorState;
 
 ////////////////////////////////////////////////////////////
 // state machine
-RuntimeStates calibrationState = RuntimeStates::Prewarm;
-unsigned long calibrationStateChangedTime = 0;
+RuntimeStates runtimeState = RuntimeStates::Prewarm;
+unsigned long runtimeStateChangedTime = 0;
 
 ////////////////////////////////////////////////////////////
 // MPU sample data
 const uint8_t SAMPLE_RING_BUFFER_SIZE = 50;
-RingBuffer accelSamplesX(SAMPLE_RING_BUFFER_SIZE), accelSamplesY(SAMPLE_RING_BUFFER_SIZE), accelSamplesZ(SAMPLE_RING_BUFFER_SIZE);
-int deadzoneX, deadzoneY, deadzoneZ;
+RingBuffer<float> accelSamplesX(SAMPLE_RING_BUFFER_SIZE), accelSamplesY(SAMPLE_RING_BUFFER_SIZE), accelSamplesZ(SAMPLE_RING_BUFFER_SIZE);
+float deadzoneX, deadzoneY, deadzoneZ;
 
 
 void setup()
 {
 	Serial.begin(115200);
-	while (!Serial);
+	while (!Serial) delay(10);
 
-	initI2C();
+	//initMPU(mpu);
+	if (!mpu.begin()) delay(10);
 
-	initMPUAndDMP(PIN_MPU_INTERRUPT, mpu, dmpStatus);
 
-	pinMode(LED_BUILTIN, OUTPUT);
-	analogWrite(LED_BUILTIN, 0);
+	//pinMode(LED_BUILTIN, OUTPUT);
+	//analogWrite(LED_BUILTIN, 0);
 
 	servo.attach(PIN_SERVO);
 	servo.write(SERVO_POSITION_CENTER); // center servo
@@ -103,25 +98,13 @@ void setup()
 	setState(RuntimeStates::Prewarm);
 }
 
-/// initialize the I2C interface
-void initI2C()
-{
-#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-    Wire.begin();
-    Wire.setClock(400000); // 400kHz I2C clock. Comment on this line if having compilation difficulties
-    Wire.setWireTimeout(3000, true);
-#elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
-    Fastwire::setup(400, true);
-#endif
-}
-
 void loop()
 {
-	if (mpu.dmpGetCurrentFIFOPacket(dmpStatus.FIFOBuffer))
+	//if (sensorState.hasData(mpu))
 	{
-		sensorState.read(mpu, dmpStatus);
+		sensorState.readData(mpu);
 
-		switch (calibrationState)
+		switch (runtimeState)
 		{
 		case RuntimeStates::Prewarm:
 			prewarm();
@@ -133,7 +116,6 @@ void loop()
 			monitorAccelerometerForInteraction();
 			break;
 		}
-
 	}
 	delay(100);
 }
@@ -142,7 +124,7 @@ void loop()
 // advances the state machine to the next state
 void advanceToNextState()
 {
-	switch (calibrationState)
+	switch (runtimeState)
 	{
 	case RuntimeStates::Prewarm:
 		setState(RuntimeStates::PrimeRingBuffer);
@@ -158,7 +140,7 @@ void advanceToNextState()
 // code executed when the state changes
 void onEnterState()
 {
-	switch (calibrationState)
+	switch (runtimeState)
 	{
 	case RuntimeStates::Prewarm:
 		logln("New State: Prewarm");
@@ -181,8 +163,8 @@ void onEnterState()
 // sets the state machine to a new state
 void setState(RuntimeStates newState)
 {
-	calibrationState = newState;
-	calibrationStateChangedTime = millis();
+	runtimeState = newState;
+	runtimeStateChangedTime = millis();
 	onEnterState();
 }
 
@@ -208,9 +190,6 @@ void primeRingBuffer()
 {
 	if (accelSamplesX.getUsedSampleCount() == accelSamplesX.getTotalSampleCount())
 	{
-		deadzoneX = (accelSamplesX.getMax() - accelSamplesX.getMin());
-		deadzoneY = (accelSamplesY.getMax() - accelSamplesY.getMin());
-		deadzoneZ = (accelSamplesZ.getMax() - accelSamplesZ.getMin());
 		logln("Deadzones:");
 		log("    x: "); logln(deadzoneX);
 		log("    y: "); logln(deadzoneY);
@@ -220,13 +199,40 @@ void primeRingBuffer()
 		return;
 	}
 
-	accelSamplesX.add(sensorState.aaReal.x);
-	accelSamplesY.add(sensorState.aaReal.y);
-	accelSamplesZ.add(sensorState.aaReal.z);
+	accelSamplesX.add(sensorState.a.acceleration.x);
+	accelSamplesY.add(sensorState.a.acceleration.y);
+	accelSamplesZ.add(sensorState.a.acceleration.z);
 
-	//plotSample(accelSamplesX, "accX", true, true, true, false);
-	//plotSample(accelSamplesY, "accY", true, false, false, false);
-	//plotSample(accelSamplesZ, "accZ", true, false, false, false);
+	deadzoneX = DISPENSE_TRIGGER_SENSITIVITY * (accelSamplesX.getMax() - accelSamplesX.getMin());
+	deadzoneY = DISPENSE_TRIGGER_SENSITIVITY * (accelSamplesY.getMax() - accelSamplesY.getMin());
+	deadzoneZ = DISPENSE_TRIGGER_SENSITIVITY * (accelSamplesZ.getMax() - accelSamplesZ.getMin());
+#ifdef LOG_SENSOR_READINGS_X
+	float avgX = accelSamplesX.getAvg();
+	DEBUG_plotSample(accelSamplesX, "accX", false, false, false, false);
+	log("\txMin:");
+	log(avgX - deadzoneX);
+	log("\txMax:");
+	log(avgX + deadzoneX);
+#endif
+#ifdef LOG_SENSOR_READINGS_Y
+	float avgY = accelSamplesY.getAvg();
+	DEBUG_plotSample(accelSamplesY, "accY", false, false, false, false);
+	log("\tyMin:");
+	log(avgY - deadzoneY);
+	log("\tyMax:");
+	log(avgY + deadzoneY);
+#endif
+#ifdef LOG_SENSOR_READINGS_Z
+	float avgZ = accelSamplesZ.getAvg();
+	DEBUG_plotSample(accelSamplesZ, "accZ", false, false, false, false);
+	log("\tzMin:");
+	log(avgZ - deadzoneZ);
+	log("\tzMax:");
+	log(avgZ + deadzoneZ);
+#endif
+#if defined(LOG_SENSOR_READINGS_X) || defined(LOG_SENSOR_READINGS_Y) || defined(LOG_SENSOR_READINGS_Z)
+	logln("");
+#endif
 }
 
 
@@ -239,32 +245,44 @@ void monitorAccelerometerForInteraction()
 	// TODO: this should probably ignore large values that triggered an interaction as this will
 	// have an impact on the average value, that the detection is based upon. due to the large number
 	// of samples this shouldn't be too big of a problem though
-	accelSamplesX.add(sensorState.aaReal.x);
-	accelSamplesY.add(sensorState.aaReal.y);
-	accelSamplesZ.add(sensorState.aaReal.z);
+	accelSamplesX.add(sensorState.a.acceleration.x);
+	accelSamplesY.add(sensorState.a.acceleration.y);
+	accelSamplesZ.add(sensorState.a.acceleration.z);
 
-	//DEBUG_plotSample(accelSamplesX, "accX", false, false, false, false);
-	//DEBUG_plotSample(accelSamplesY, "accY", false, false, false, false);
-	//DEBUG_plotSample(accelSamplesZ, "accZ", false, false, false, false);
+	const bool logAvg = false;
+	const bool logMin = false;
+	const bool logMax = false;
+	float avgX = accelSamplesX.getAvg();
+	float avgY = accelSamplesY.getAvg();
+	float avgZ = accelSamplesZ.getAvg();
 
-	int16_t avgX = accelSamplesX.getAvg();
-	//log("\txMin:");
-	//log(avgX - deadzoneX);
-	//log("\txMax:");
-	//log(avgX + deadzoneX);
+#ifdef LOG_SENSOR_READINGS_X
+	DEBUG_plotSample(accelSamplesX, "accX", logAvg, logMin, logMax, false);
+	log("\txMin:");
+	log(avgX - deadzoneX);
+	log("\txMax:");
+	log(avgX + deadzoneX);
+#endif
 
-	int16_t avgY = accelSamplesY.getAvg();
-	//log("\tyMin:");
-	//log(avgY - deadzoneY);
-	//log("\tyMax:");
-	//log(avgY + deadzoneY);
+#ifdef LOG_SENSOR_READINGS_Y
+	DEBUG_plotSample(accelSamplesY, "accY", logAvg, logMin, logMax, false);
+	log("\tyMin:");
+	log(avgY - deadzoneY);
+	log("\tyMax:");
+	log(avgY + deadzoneY);
+#endif
 
-	int16_t avgZ = accelSamplesZ.getAvg();
-	//log("\tzMin:");
-	//log(avgZ - deadzoneZ);
-	//log("\tzMax:");
-	//log(avgZ + deadzoneZ);
-	//logln("");
+#ifdef LOG_SENSOR_READINGS_Z
+	DEBUG_plotSample(accelSamplesZ, "accZ", logAvg, logMin, logMax, false);
+	log("\tzMin:");
+	log(avgZ - deadzoneZ);
+	log("\tzMax:");
+	log(avgZ + deadzoneZ);
+#endif
+
+#if defined(LOG_SENSOR_READINGS_X) || defined(LOG_SENSOR_READINGS_Y) || defined(LOG_SENSOR_READINGS_Z)
+	logln("");
+#endif
 
 	uint32_t now = millis();
 	// check the current acceleration values against the deadzone to detect an interaction
@@ -426,7 +444,7 @@ bool doStateCountDown(uint16_t totalDuration)
 {
 	static int prevCountdownValue = 0;
 
-	long timeSinceStateStart = millis() - calibrationStateChangedTime;
+	long timeSinceStateStart = millis() - runtimeStateChangedTime;
 	long remaining = max(0, totalDuration - timeSinceStateStart);
 	int countdownValue = ceil(remaining * 0.001f);
 	if (countdownValue != prevCountdownValue)
@@ -456,7 +474,7 @@ void DEBUG_printRecentDispenseTimes()
 
 ////////////////////////////////////////////////////////////
 //  Sends the state of the RingBuffer to the Serial Monitor/Plotter
-void DEBUG_plotSample(const RingBuffer &sample, const char *label, bool avg, bool min, bool max, bool offsetByAvg)
+void DEBUG_plotSample(const RingBuffer<float> &sample, const char *label, bool avg, bool min, bool max, bool offsetByAvg)
 {
 	int16_t offset = 0;
 	if (offsetByAvg)
